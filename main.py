@@ -7,7 +7,7 @@ import json
 import hashlib
 from collections import defaultdict
 
-app = FastAPI(title="MCBSE Test Harness", version="1.1.0")
+app = FastAPI(title="MCBSE Test Harness", version="1.1.1")
 
 # CORS for browser access
 app.add_middleware(
@@ -20,7 +20,6 @@ app.add_middleware(
 
 # UNIFIED in-memory storage for MCBSE simulation
 memory_store = {}
-committed_hashes = set()
 
 # Rate limiting
 request_log = defaultdict(list)
@@ -69,9 +68,8 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.1.0",
-        "storage_keys": len(memory_store),
-        "committed_hashes": len(committed_hashes)
+        "version": "1.1.1",
+        "storage_keys": len(memory_store)
     }
 
 
@@ -109,24 +107,29 @@ class NoveltyRequest(BaseModel):
 @app.post("/test/novelty")
 async def test_novelty(request: Request, req: NoveltyRequest):
     ip = request.client.host
-    content_key = f"{ip}:{req.content}"
-    content_hash = get_stable_hash(content_key)
-    is_duplicate = content_hash in committed_hashes
+    storage_key = f"novelty:{ip}:{req.content}"
     
-    if not is_duplicate:
-        committed_hashes.add(content_hash)
-        memory_store[f"novelty:{content_hash}"] = {
+    # Check if this exact content was already committed in unified storage
+    exists = storage_key in memory_store
+    
+    if not exists:
+        # First time seeing this content - commit it
+        memory_store[storage_key] = {
             "content": req.content,
-            "content_hash": content_hash,
-            "first_seen": datetime.utcnow().isoformat()
+            "first_seen": datetime.utcnow().isoformat(),
+            "type": "novelty"
         }
+    
+    # Count total novelty entries for this IP
+    total_commits = sum(1 for k in memory_store.keys() if k.startswith(f"novelty:{ip}:"))
     
     result = {
         "test": "novelty",
         "content": req.content,
-        "is_duplicate": is_duplicate,
-        "memory_commit": not is_duplicate,
-        "total_unique_commits": len(committed_hashes),
+        "is_duplicate": exists,
+        "memory_commit": not exists,
+        "total_unique_commits": total_commits,
+        "notes": "Duplicate detected - no re-encoding" if exists else "Novel content - committed"
     }
     log_request(ip, "novelty", result)
     return result
@@ -273,7 +276,7 @@ async def test_page():
         </style>
     </head>
     <body>
-        <h1>MCBSE Test Harness v1.1.0</h1>
+        <h1>MCBSE Test Harness v1.1.1</h1>
         
         <div class="test-section">
             <h3>1. Health Check</h3>
