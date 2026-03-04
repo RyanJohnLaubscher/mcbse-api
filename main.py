@@ -20,7 +20,7 @@ except Exception as e:
     USE_REDIS = False
     print(f"Redis not available, using file storage: {e}")
 
-app = FastAPI(title="MCBSE Test Harness", version="1.2.0")
+app = FastAPI(title="MCBSE Test Harness", version="1.3.0")
 
 # CORS for browser access
 app.add_middleware(
@@ -110,6 +110,14 @@ def get_storage_count() -> int:
             return 0
 
 
+def get_client_ip(request: Request) -> str:
+    """Get consistent client IP, checking X-Forwarded-For for proxied deployments."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
+
+
 def log_request(ip: str, test_type: str, result: dict):
     """Log request to JSON file"""
     entry = {
@@ -147,7 +155,7 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.2.0",
+        "version": "1.3.0",
         "storage_keys": get_storage_count(),
         "redis_enabled": USE_REDIS
     }
@@ -199,30 +207,35 @@ class NoveltyRequest(BaseModel):
 
 @app.post("/test/novelty")
 async def test_novelty(request: Request, req: NoveltyRequest):
-    ip = request.client.host
-    storage_key = f"novelty:{ip}:{req.content}"
-    
-    # Check if this exact content was already committed
-    exists = exists_storage(storage_key)
-    
-    if not exists:
-        # First time seeing this content - commit it
-        data = {
-            "content": req.content,
-            "first_seen": datetime.utcnow().isoformat()
-        }
-        set_storage(storage_key, json.dumps(data))
-    
-    # Count total novelty entries for this IP
+    ip = get_client_ip(request)
+    content_hash = hashlib.sha256(req.content.encode()).hexdigest()
+    storage_key = f"novelty:{ip}:{content_hash}"
+
+    data = json.dumps({
+        "content": req.content,
+        "first_seen": datetime.utcnow().isoformat()
+    })
+
+    if USE_REDIS:
+        # Atomic set-if-not-exists: returns True if key was NEW, False if it already existed
+        is_novel = r.setnx(storage_key, data)
+    else:
+        # File fallback (single-process only, no race condition concern)
+        is_novel = not exists_storage(storage_key)
+        if is_novel:
+            set_storage(storage_key, data)
+
+    is_duplicate = not is_novel
+
     total_commits = count_storage_prefix(f"novelty:{ip}:")
-    
+
     result = {
         "test": "novelty",
         "content": req.content,
-        "is_duplicate": exists,
-        "memory_commit": not exists,
+        "is_duplicate": is_duplicate,
+        "memory_commit": is_novel,
         "total_unique_commits": total_commits,
-        "notes": "Duplicate detected - no re-encoding" if exists else "Novel content - committed"
+        "notes": "Duplicate detected - no re-encoding" if is_duplicate else "Novel content - committed"
     }
     log_request(ip, "novelty", result)
     return result
@@ -371,7 +384,7 @@ async def test_page():
         </style>
     </head>
     <body>
-        <h1>MCBSE Test Harness v1.2.0</h1>
+        <h1>MCBSE Test Harness v1.3.0</h1>
         
         <div class="test-section">
             <h3>1. Health Check</h3>
