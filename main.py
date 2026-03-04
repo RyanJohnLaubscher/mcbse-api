@@ -5,9 +5,22 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import json
 import hashlib
+import os
 from collections import defaultdict
 
-app = FastAPI(title="MCBSE Test Harness", version="1.1.1")
+# Try to use Redis, fallback to file-based storage if not available
+try:
+    import redis
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r.ping()  # Test connection
+    USE_REDIS = True
+    print("Redis connected successfully")
+except Exception as e:
+    USE_REDIS = False
+    print(f"Redis not available, using file storage: {e}")
+
+app = FastAPI(title="MCBSE Test Harness", version="1.2.0")
 
 # CORS for browser access
 app.add_middleware(
@@ -18,21 +31,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# UNIFIED in-memory storage for MCBSE simulation
-memory_store = {}
+# Fallback storage file
+STORAGE_FILE = "/tmp/mcbse_storage.json"
 
-# Rate limiting
+# Rate limiting (per-process, not shared)
 request_log = defaultdict(list)
 RATE_LIMIT = 100
 RATE_WINDOW = timedelta(hours=24)
 LOG_FILE = "mcbse_requests.jsonl"
 
 
-def get_stable_hash(content: str) -> str:
-    return hashlib.md5(content.encode()).hexdigest()
+def get_storage(key: str):
+    """Get value from Redis or file"""
+    if USE_REDIS:
+        return r.get(key)
+    else:
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get(key)
+        except:
+            return None
+
+
+def set_storage(key: str, value: str):
+    """Set value in Redis or file"""
+    if USE_REDIS:
+        r.set(key, value)
+    else:
+        try:
+            data = {}
+            if os.path.exists(STORAGE_FILE):
+                with open(STORAGE_FILE, "r") as f:
+                    data = json.load(f)
+            data[key] = value
+            with open(STORAGE_FILE, "w") as f:
+                json.dump(data, f)
+        except:
+            pass
+
+
+def exists_storage(key: str) -> bool:
+    """Check if key exists"""
+    if USE_REDIS:
+        return r.exists(key) > 0
+    else:
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                data = json.load(f)
+                return key in data
+        except:
+            return False
+
+
+def count_storage_prefix(prefix: str) -> int:
+    """Count keys with prefix"""
+    if USE_REDIS:
+        return len(list(r.scan_iter(match=f"{prefix}*")))
+    else:
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                data = json.load(f)
+                return sum(1 for k in data.keys() if k.startswith(prefix))
+        except:
+            return 0
+
+
+def get_storage_count() -> int:
+    """Get total storage count"""
+    if USE_REDIS:
+        return r.dbsize()
+    else:
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                data = json.load(f)
+                return len(data)
+        except:
+            return 0
 
 
 def log_request(ip: str, test_type: str, result: dict):
+    """Log request to JSON file"""
     entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "ip": ip,
@@ -68,8 +147,9 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.1.1",
-        "storage_keys": len(memory_store)
+        "version": "1.2.0",
+        "storage_keys": get_storage_count(),
+        "redis_enabled": USE_REDIS
     }
 
 
@@ -81,21 +161,34 @@ class PersistenceRequest(BaseModel):
 @app.post("/test/persistence")
 async def test_persistence(request: Request, req: PersistenceRequest):
     ip = request.client.host
-    storage_key = f"{ip}:{req.key}"
-    memory_store[storage_key] = {
+    storage_key = f"persist:{ip}:{req.key}"
+    
+    # Store with timestamp
+    data = {
         "value": req.value,
-        "stored_at": datetime.utcnow().isoformat(),
-        "type": "persistence"
+        "stored_at": datetime.utcnow().isoformat()
     }
-    retrieved = memory_store.get(storage_key)
-    result = {
-        "test": "persistence",
-        "key": req.key,
-        "stored_value": req.value,
-        "retrieved_value": retrieved["value"] if retrieved else None,
-        "persistence_verified": retrieved is not None and retrieved["value"] == req.value,
-        "state_match": 1.0 if (retrieved and retrieved["value"] == req.value) else 0.0,
-    }
+    set_storage(storage_key, json.dumps(data))
+    
+    # Retrieve to verify
+    stored = get_storage(storage_key)
+    if stored:
+        stored_data = json.loads(stored)
+        result = {
+            "test": "persistence",
+            "key": req.key,
+            "stored_value": req.value,
+            "retrieved_value": stored_data["value"],
+            "persistence_verified": stored_data["value"] == req.value,
+            "state_match": 1.0 if stored_data["value"] == req.value else 0.0,
+        }
+    else:
+        result = {
+            "test": "persistence",
+            "key": req.key,
+            "error": "Storage failed"
+        }
+    
     log_request(ip, "persistence", result)
     return result
 
@@ -109,19 +202,19 @@ async def test_novelty(request: Request, req: NoveltyRequest):
     ip = request.client.host
     storage_key = f"novelty:{ip}:{req.content}"
     
-    # Check if this exact content was already committed in unified storage
-    exists = storage_key in memory_store
+    # Check if this exact content was already committed
+    exists = exists_storage(storage_key)
     
     if not exists:
         # First time seeing this content - commit it
-        memory_store[storage_key] = {
+        data = {
             "content": req.content,
-            "first_seen": datetime.utcnow().isoformat(),
-            "type": "novelty"
+            "first_seen": datetime.utcnow().isoformat()
         }
+        set_storage(storage_key, json.dumps(data))
     
     # Count total novelty entries for this IP
-    total_commits = sum(1 for k in memory_store.keys() if k.startswith(f"novelty:{ip}:"))
+    total_commits = count_storage_prefix(f"novelty:{ip}:")
     
     result = {
         "test": "novelty",
@@ -142,11 +235,13 @@ class NullRequest(BaseModel):
 @app.post("/test/null")
 async def test_null(request: Request, req: NullRequest):
     ip = request.client.host
-    storage_key = f"{ip}:{req.query}"
-    exists = storage_key in memory_store
-    stored_data = memory_store.get(storage_key)
+    storage_key = f"persist:{ip}:{req.query}"
     
-    if exists and stored_data:
+    exists = exists_storage(storage_key)
+    stored = get_storage(storage_key)
+    
+    if exists and stored:
+        stored_data = json.loads(stored)
         result = {
             "test": "null_retrieval",
             "query": req.query,
@@ -276,7 +371,7 @@ async def test_page():
         </style>
     </head>
     <body>
-        <h1>MCBSE Test Harness v1.1.1</h1>
+        <h1>MCBSE Test Harness v1.2.0</h1>
         
         <div class="test-section">
             <h3>1. Health Check</h3>
