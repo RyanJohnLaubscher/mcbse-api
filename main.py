@@ -17,7 +17,7 @@ request_log = {}
 LOG_FILE = "mcbse_requests.jsonl"
 
 # Rate limiting: 10 requests per 24 hours per IP
-RATE_LIMIT = 10
+RATE_LIMIT = 100
 RATE_WINDOW = 86400  # 24 hours in seconds
 
 
